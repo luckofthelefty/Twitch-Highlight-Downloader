@@ -76,10 +76,7 @@ def refresh_access_token():
         return False
 
 def sanitize_filename(title: str) -> str:
-    """
-    Sanitize the Twitch video title for safe filesystem storage.
-    Ensures filename consistency when checking downloaded files.
-    """
+    """Sanitize the Twitch video title for safe filesystem storage."""
     sanitized = title
     sanitized = sanitized.replace(" ", "_")
     sanitized = sanitized.replace("/", "-")
@@ -125,7 +122,6 @@ def get_twitch_highlights(max_videos, downloaded_videos):
             remaining_videos.append(video)
         if len(remaining_videos) >= max_videos:
             break
-
     return remaining_videos
 
 class MyLogger:
@@ -173,13 +169,16 @@ def download_video(video, index, shared_dict):
     shared_dict[index] = {"progress": 100, "speed": "0.00 MB/s"}
     return f"Downloaded: {save_path}"
 
-def kill_executor_processes(executor):
-    """Safely terminate any child processes if they still exist."""
-    if executor is None:
+def terminate_child_processes(executor):
+    """
+    Attempt to forcibly terminate any still-running child processes in the executor.
+    We copy the reference to _processes before calling shutdown.
+    """
+    if not executor:
         return
-    # The _processes attribute may not exist if the executor is already shut down
+    # The _processes attribute can disappear after executor.shutdown
     processes = getattr(executor, "_processes", None)
-    if processes is not None:
+    if processes:
         for p in processes.values():
             if p.is_alive():
                 p.terminate()
@@ -199,12 +198,20 @@ def main():
 
     overall_progress = tqdm(total=total_videos, desc="Overall Progress", position=0, leave=True)
     
+    # Create executor outside of the try/except
     executor = concurrent.futures.ProcessPoolExecutor(max_workers=MAX_CONCURRENT_DOWNLOADS)
+    # Grab the processes reference now (if any) so we can forcibly terminate them later if needed
+    pool_processes = getattr(executor, "_processes", None)
+
     futures = {executor.submit(download_video, video, i, progress_dict): i for i, video in enumerate(videos)}
 
     try:
         while futures:
-            done, not_done = concurrent.futures.wait(futures, timeout=0.5, return_when=concurrent.futures.FIRST_COMPLETED)
+            done, not_done = concurrent.futures.wait(
+                futures,
+                timeout=0.5,
+                return_when=concurrent.futures.FIRST_COMPLETED
+            )
             for fut in done:
                 overall_progress.update(1)
                 try:
@@ -214,22 +221,37 @@ def main():
                 overall_progress.write(str(result))
                 futures.pop(fut, None)
 
+            # If user pressed Ctrl+C or signaled shutdown
             if shutdown_flag:
                 overall_progress.write("Shutdown requested. Cancelling remaining tasks...")
                 for fut in futures:
                     fut.cancel()
+                # Cancel futures, do not wait
                 executor.shutdown(wait=False, cancel_futures=True)
+                # Attempt to forcibly kill child processes
+                if pool_processes:
+                    for p in pool_processes.values():
+                        if p.is_alive():
+                            p.terminate()
                 break
+
     except KeyboardInterrupt:
         overall_progress.write("KeyboardInterrupt detected. Cancelling tasks...")
         for fut in futures:
             fut.cancel()
         executor.shutdown(wait=False, cancel_futures=True)
-    finally:
-        # Attempt to forcibly kill child processes
-        kill_executor_processes(executor)
-        executor.shutdown(wait=False, cancel_futures=True)
+        # Terminate child processes
+        if pool_processes:
+            for p in pool_processes.values():
+                if p.is_alive():
+                    p.terminate()
 
+    finally:
+        # If the loop ends normally, shut down the executor
+        # (If it hasn't been shut down yet)
+        executor.shutdown(wait=False, cancel_futures=True)
+        # Force kill any leftover processes
+        terminate_child_processes(executor)
         overall_progress.close()
         print("Cleanup complete. Exiting...")
 
