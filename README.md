@@ -1,5 +1,7 @@
 # Twitch Highlights Downloader
 
+[Wiki](https://github.com/luckofthelefty/Twitch-Highlight-Downloader/wiki/Step-by-Step-Guide) (Step by Step Guide to running the script)
+
 Twitch Highlights Downloader is a Python script that leverages the Twitch API and yt-dlp to download your Twitch highlights concurrently. It features real-time, per-download progress bars (including current download speed in MB/s) as well as an overall progress indicator.
 
 ## Features
