@@ -19,6 +19,9 @@ MAX_CONCURRENT_DOWNLOADS = 10
 os.makedirs(SAVE_DIR, exist_ok=True)
 shutdown_flag = False
 
+# ---------------------------------------------------------------------
+# Signal Handling
+# ---------------------------------------------------------------------
 def signal_handler(sig, frame):
     global shutdown_flag
     print("\nShutdown requested. Cleaning up...")
@@ -26,6 +29,9 @@ def signal_handler(sig, frame):
 
 signal.signal(signal.SIGINT, signal_handler)
 
+# ---------------------------------------------------------------------
+# Token Management
+# ---------------------------------------------------------------------
 def load_tokens():
     """Load the saved Twitch tokens from a file."""
     global TWITCH_ACCESS_TOKEN, TWITCH_REFRESH_TOKEN
@@ -40,7 +46,8 @@ def load_tokens():
         TWITCH_REFRESH_TOKEN = ""
 
 def save_tokens():
-    """Save the updated Twitch tokens to a file for future use."""
+    """Save the updated Twitch tokens to a file."""
+    global TWITCH_ACCESS_TOKEN, TWITCH_REFRESH_TOKEN
     data = {
         "access_token": TWITCH_ACCESS_TOKEN,
         "refresh_token": TWITCH_REFRESH_TOKEN
@@ -62,7 +69,6 @@ def refresh_access_token():
         "grant_type": "refresh_token",
         "refresh_token": TWITCH_REFRESH_TOKEN
     }
-
     response = requests.post(url, data=data)
     if response.status_code == 200:
         token_data = response.json()
@@ -75,6 +81,9 @@ def refresh_access_token():
         print(f"❌ Failed to refresh token: {response.json()}")
         return False
 
+# ---------------------------------------------------------------------
+# Helper Functions
+# ---------------------------------------------------------------------
 def sanitize_filename(title: str) -> str:
     """Sanitize the Twitch video title for safe filesystem storage."""
     sanitized = title
@@ -84,7 +93,7 @@ def sanitize_filename(title: str) -> str:
 
 def get_twitch_highlights(max_videos, downloaded_videos):
     """
-    Fetch the latest Twitch highlights and return only the new ones (skipping already downloaded).
+    Fetch the latest Twitch highlights and return only the new ones.
     If the token is expired, refresh it and retry once.
     """
     url = "https://api.twitch.tv/helix/videos"
@@ -107,7 +116,6 @@ def get_twitch_highlights(max_videos, downloaded_videos):
 
     all_videos = response.json().get("data", [])
     downloaded_filenames = {file.lower() for file in downloaded_videos}
-
     remaining_videos = []
     for video in all_videos:
         file_name = f"{sanitize_filename(video['title'])}.mp4"
@@ -123,60 +131,50 @@ class MyLogger:
     def warning(self, msg): pass
     def error(self, msg): print(msg)
 
+# ---------------------------------------------------------------------
+# Progress Hook and Download Function (Working Version)
+# ---------------------------------------------------------------------
 def create_progress_hook(shared_dict, index):
     """
-    Creates a progress hook that updates a shared dictionary:
-      - progress (0..100)
-      - downloaded (str): e.g., "5.23 MB"
-      - total (str): e.g., "50.00 MB"
-      - speed (str): e.g., "3.27 MB/s"
+    Creates a progress hook that updates a shared dictionary with:
+       - progress (0-100)
+       - speed (e.g., "1.23 MB/s")
+    Falls back to using fragment_index if total_bytes is missing.
     """
     def hook(status_dict):
         if shutdown_flag:
             return
         if status_dict["status"] == "downloading":
-            total_bytes = status_dict.get("total_bytes") or 0
-            downloaded = status_dict.get("downloaded_bytes", 0)
-            speed_bytes = status_dict.get("speed", 0)
-
-            # Calculate progress
-            if total_bytes > 0:
+            total_bytes = status_dict.get("total_bytes")
+            if total_bytes and total_bytes > 0:
+                downloaded = status_dict.get("downloaded_bytes", 0)
                 progress = int(downloaded / total_bytes * 100)
             else:
-                progress = 0
+                frag_idx = status_dict.get("fragment_index")
+                frag_count = status_dict.get("fragment_count")
+                if frag_idx is not None and frag_count:
+                    progress = int(frag_idx / frag_count * 100)
+                else:
+                    progress = 0
 
-            # Convert to MB
-            downloaded_mb = f"{downloaded / (1024*1024):.2f} MB"
-            speed_str = f"{speed_bytes / (1024*1024):.2f} MB/s" if speed_bytes else "N/A"
-
-            shared_dict[index] = {
-                "progress": progress,
-                "downloaded": downloaded_mb,
-                "speed": speed_str
-            }
-
+            speed_bytes = status_dict.get("speed")
+            if speed_bytes is not None:
+                speed_str = f"{(speed_bytes/(1024*1024)):.2f} MB/s"
+            else:
+                speed_str = "N/A"
+            shared_dict[index] = {"progress": progress, "speed": speed_str}
         elif status_dict["status"] == "finished":
-            # Mark final as 100% and speed=0
-            existing = shared_dict.get(index, {})
-            shared_dict[index] = {
-                "progress": 100,
-                "downloaded": existing.get("downloaded", "0.00 MB"),
-                "speed": "0.00 MB/s"
-            }
+            shared_dict[index] = {"progress": 100, "speed": "0.00 MB/s"}
     return hook
 
 def download_video(video, index, shared_dict):
-    """Runs in a separate process to download a video using yt_dlp."""
+    """
+    Downloads a video using yt_dlp with a progress hook that updates shared_dict.
+    """
     video_title = sanitize_filename(video["title"])
     save_path = os.path.join(SAVE_DIR, f"{video_title}.mp4")
-
     if os.path.exists(save_path):
-        # Mark as 100% if already present
-        shared_dict[index] = {
-            "progress": 100,
-            "downloaded": "0.00 MB",
-            "speed": "0.00 MB/s"
-        }
+        shared_dict[index] = {"progress": 100, "speed": "0.00 MB/s"}
         return f"Already downloaded: {save_path}"
 
     ydl_opts = {
@@ -193,19 +191,10 @@ def download_video(video, index, shared_dict):
         except Exception as e:
             return f"Download failed: {e}"
 
-    # Fallback if the hook never updated
-    if index not in shared_dict:
-        shared_dict[index] = {
-            "progress": 100,
-            "downloaded": "0.00 MB",
-            "speed": "0.00 MB/s"
-        }
+    shared_dict[index] = {"progress": 100, "speed": "0.00 MB/s"}
     return f"Downloaded: {save_path}"
 
 def terminate_child_processes(executor):
-    """
-    Attempt to forcibly terminate any still-running child processes in the executor.
-    """
     if not executor:
         return
     processes = getattr(executor, "_processes", None)
@@ -214,103 +203,52 @@ def terminate_child_processes(executor):
             if p.is_alive():
                 p.terminate()
 
+# ---------------------------------------------------------------------
+# Main Routine
+# ---------------------------------------------------------------------
 def main():
     load_tokens()
     manager = Manager()
     progress_dict = manager.dict()
-
     downloaded_videos = set(os.listdir(SAVE_DIR))
     max_videos = int(sys.argv[1]) if len(sys.argv) > 1 else 2
     videos = get_twitch_highlights(max_videos, downloaded_videos)
     total_videos = len(videos)
-
     if total_videos == 0:
         print("No new highlights found.")
         return
 
-    # Overall progress bar
     overall_progress = tqdm(total=total_videos, desc="Overall Progress", position=0, leave=True)
+    progress_bars = [
+        tqdm(total=100, desc=f"[{i+1}/{total_videos}] {sanitize_filename(vid['title'])[:30]}...", position=i+1, leave=False,
+             bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt}% {postfix}")
+        for i, vid in enumerate(videos)
+    ]
 
-    # Individual bars
-    progress_bars = []
-    for i, vid in enumerate(videos):
-        short_title = sanitize_filename(vid["title"])[:30] + "..."
-        desc_str = f"[{i+1}/{total_videos}] {short_title}"
-        bar = tqdm(
-            total=100,
-            desc=desc_str,
-            position=i + 1,
-            leave=False,
-            bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} {postfix}"
-        )
-        progress_bars.append(bar)
-
-    executor = concurrent.futures.ProcessPoolExecutor(max_workers=MAX_CONCURRENT_DOWNLOADS)
-    pool_processes = getattr(executor, "_processes", None)
-
-    # Submit downloads
-    futures = {
-        executor.submit(download_video, video, i, progress_dict): i
-        for i, video in enumerate(videos)
-    }
-
-    try:
-        while futures:
-            done, _not_done = concurrent.futures.wait(
-                futures,
-                timeout=0.5,
-                return_when=concurrent.futures.FIRST_COMPLETED
-            )
-
-            # Update each bar
+    with concurrent.futures.ProcessPoolExecutor(max_workers=MAX_CONCURRENT_DOWNLOADS) as executor:
+        futures = {executor.submit(download_video, video, i, progress_dict): i for i, video in enumerate(videos)}
+        completed = set()
+        while len(completed) < len(futures):
             for i, bar in enumerate(progress_bars):
-                if i in progress_dict:
-                    data = progress_dict[i]
-                    # Progress = 0..100
-                    bar.n = data["progress"]
-                    # Show something like "3.12 MB / 15.00 MB @ 2.22 MB/s"
-                    postfix_str = f"{data['downloaded']} @ {data['speed']}"
-                    bar.set_postfix_str(postfix_str)
-                    bar.refresh()
-
-            for fut in done:
-                overall_progress.update(1)
-                try:
-                    result = fut.result()
-                except Exception as exc:
-                    result = f"Download failed: {exc}"
-                overall_progress.write(str(result))
-                futures.pop(fut, None)
-
-            if shutdown_flag:
-                overall_progress.write("Shutdown requested. Cancelling remaining tasks...")
-                for fut in futures:
-                    fut.cancel()
-                executor.shutdown(wait=False, cancel_futures=True)
-                if pool_processes:
-                    for p in pool_processes.values():
-                        if p.is_alive():
-                            p.terminate()
-                break
-
-    except KeyboardInterrupt:
-        overall_progress.write("KeyboardInterrupt detected. Cancelling tasks...")
-        for fut in futures:
-            fut.cancel()
-        executor.shutdown(wait=False, cancel_futures=True)
-        if pool_processes:
-            for p in pool_processes.values():
-                if p.is_alive():
-                    p.terminate()
-
-    finally:
-        executor.shutdown(wait=False, cancel_futures=True)
-        terminate_child_processes(executor)
-        overall_progress.close()
-        for bar in progress_bars:
-            bar.close()
-        print("Cleanup complete. Exiting...")
+                data = progress_dict.get(i, {"progress": 0, "speed": "N/A"})
+                bar.n = data["progress"]
+                bar.set_postfix_str(data["speed"])
+                bar.refresh()
+            for fut in list(futures):
+                if fut.done() and fut not in completed:
+                    overall_progress.update(1)
+                    try:
+                        result = fut.result()
+                    except Exception as exc:
+                        result = f"Download failed: {exc}"
+                    overall_progress.write(result)
+                    completed.add(fut)
+                    futures.pop(fut, None)
+            time.sleep(0.2)
+    overall_progress.close()
+    for bar in progress_bars:
+        bar.close()
+    print("Cleanup complete. Exiting...")
 
 if __name__ == "__main__":
     main()
-
