@@ -49,6 +49,37 @@ Before running the script, open `downloader.py` and replace the placeholder valu
 
 Alternatively, you can load these values from environment variables or a configuration file to keep your credentials secure.
 
+### Obtaining Twitch API Credentials
+
+To download highlights from Twitch, you'll need a **Twitch Client ID** and an **OAuth token** with the correct permissions.
+
+#### 1. Create a Twitch Developer Application
+1. Go to the [Twitch Developer Console](https://dev.twitch.tv/console/apps).
+2. Click **"Register Your Application"**.
+3. Fill in the following details:
+   - **Name:** Choose a name for your application (e.g., "Twitch Highlights Downloader").
+   - **OAuth Redirect URLs:** Set this to:  
+     ```
+     https://twitchtokengenerator.com
+     ```
+   - **Category:** Select "Application Integration".
+4. Click **Create** and save your **Client ID**.
+5. Click **Manage** on your newly created app and generate a **Client Secret** (this is only needed if using advanced authentication).
+
+#### 2. Generate an OAuth Token
+
+To authenticate and obtain an access token, follow these steps:
+1. Click **"Custom Scope Token"**.
+2. Visit [Twitch Token Generator](https://twitchtokengenerator.com/).
+3. Scroll down to **"Use My Client Secret and Client ID"**.
+4. Enter your **Client ID** and **Client Secret** from the Twitch Developer Console.
+5. Select the required scope:
+   - `channel:manage:videos`
+6. Click **"Generate Token"** and **authorize** with your Twitch account.
+7. Copy the generated **OAuth Token** and use it in your script.
+
+---
+
 ## Usage
 
 Run the script from the command line and pass the number of highlights you want to download. For example, to download 2 highlights:
