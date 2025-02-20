@@ -78,15 +78,8 @@ def refresh_access_token():
 def sanitize_filename(title: str) -> str:
     """Sanitize the Twitch video title for safe filesystem storage."""
     sanitized = title
-    sanitized = sanitized.replace(" ", "_")
-    sanitized = sanitized.replace("/", "-")
-    sanitized = sanitized.replace("|", "_")
-    sanitized = sanitized.replace("#", "_")
-    sanitized = sanitized.replace(":", "_")
-    sanitized = sanitized.replace('"', "_")
-    sanitized = sanitized.replace("?", "_")
-    sanitized = sanitized.replace("\\", "_")
-    sanitized = sanitized.replace("*", "_")
+    for ch in [' ', '/', '|', '#', ':', '"', '?', '\\', '*']:
+        sanitized = sanitized.replace(ch, '_')
     return sanitized.lower()
 
 def get_twitch_highlights(max_videos, downloaded_videos):
@@ -131,27 +124,59 @@ class MyLogger:
     def error(self, msg): print(msg)
 
 def create_progress_hook(shared_dict, index):
-    """Creates a progress hook that updates a shared dictionary."""
+    """
+    Creates a progress hook that updates a shared dictionary:
+      - progress (0..100)
+      - downloaded (str): e.g., "5.23 MB"
+      - total (str): e.g., "50.00 MB"
+      - speed (str): e.g., "3.27 MB/s"
+    """
     def hook(status_dict):
         if shutdown_flag:
             return
         if status_dict["status"] == "downloading":
-            total_bytes = status_dict.get("total_bytes")
+            total_bytes = status_dict.get("total_bytes") or 0
             downloaded = status_dict.get("downloaded_bytes", 0)
-            progress = int((downloaded / total_bytes) * 100) if total_bytes else 0
-            speed_bytes = status_dict.get("speed")
-            speed_str = f"{(speed_bytes / (1024 * 1024)):.2f} MB/s" if speed_bytes else "N/A"
-            shared_dict[index] = {"progress": progress, "speed": speed_str}
+            speed_bytes = status_dict.get("speed", 0)
+
+            # Calculate progress
+            if total_bytes > 0:
+                progress = int(downloaded / total_bytes * 100)
+            else:
+                progress = 0
+
+            # Convert to MB
+            downloaded_mb = f"{downloaded / (1024*1024):.2f} MB"
+            speed_str = f"{speed_bytes / (1024*1024):.2f} MB/s" if speed_bytes else "N/A"
+
+            shared_dict[index] = {
+                "progress": progress,
+                "downloaded": downloaded_mb,
+                "speed": speed_str
+            }
+
         elif status_dict["status"] == "finished":
-            shared_dict[index] = {"progress": 100, "speed": "0.00 MB/s"}
+            # Mark final as 100% and speed=0
+            existing = shared_dict.get(index, {})
+            shared_dict[index] = {
+                "progress": 100,
+                "downloaded": existing.get("downloaded", "0.00 MB"),
+                "speed": "0.00 MB/s"
+            }
     return hook
 
 def download_video(video, index, shared_dict):
     """Runs in a separate process to download a video using yt_dlp."""
     video_title = sanitize_filename(video["title"])
     save_path = os.path.join(SAVE_DIR, f"{video_title}.mp4")
+
     if os.path.exists(save_path):
-        shared_dict[index] = {"progress": 100, "speed": "0.00 MB/s"}
+        # Mark as 100% if already present
+        shared_dict[index] = {
+            "progress": 100,
+            "downloaded": "0.00 MB",
+            "speed": "0.00 MB/s"
+        }
         return f"Already downloaded: {save_path}"
 
     ydl_opts = {
@@ -161,22 +186,28 @@ def download_video(video, index, shared_dict):
         "no_warnings": True,
         "progress_hooks": [create_progress_hook(shared_dict, index)]
     }
+
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         try:
             ydl.download([video["url"]])
         except Exception as e:
             return f"Download failed: {e}"
-    shared_dict[index] = {"progress": 100, "speed": "0.00 MB/s"}
+
+    # Fallback if the hook never updated
+    if index not in shared_dict:
+        shared_dict[index] = {
+            "progress": 100,
+            "downloaded": "0.00 MB",
+            "speed": "0.00 MB/s"
+        }
     return f"Downloaded: {save_path}"
 
 def terminate_child_processes(executor):
     """
     Attempt to forcibly terminate any still-running child processes in the executor.
-    We copy the reference to _processes before calling shutdown.
     """
     if not executor:
         return
-    # The _processes attribute can disappear after executor.shutdown
     processes = getattr(executor, "_processes", None)
     if processes:
         for p in processes.values():
@@ -192,26 +223,56 @@ def main():
     max_videos = int(sys.argv[1]) if len(sys.argv) > 1 else 2
     videos = get_twitch_highlights(max_videos, downloaded_videos)
     total_videos = len(videos)
+
     if total_videos == 0:
         print("No new highlights found.")
         return
 
+    # Overall progress bar
     overall_progress = tqdm(total=total_videos, desc="Overall Progress", position=0, leave=True)
-    
-    # Create executor outside of the try/except
+
+    # Individual bars
+    progress_bars = []
+    for i, vid in enumerate(videos):
+        short_title = sanitize_filename(vid["title"])[:30] + "..."
+        desc_str = f"[{i+1}/{total_videos}] {short_title}"
+        bar = tqdm(
+            total=100,
+            desc=desc_str,
+            position=i + 1,
+            leave=False,
+            bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} {postfix}"
+        )
+        progress_bars.append(bar)
+
     executor = concurrent.futures.ProcessPoolExecutor(max_workers=MAX_CONCURRENT_DOWNLOADS)
-    # Grab the processes reference now (if any) so we can forcibly terminate them later if needed
     pool_processes = getattr(executor, "_processes", None)
 
-    futures = {executor.submit(download_video, video, i, progress_dict): i for i, video in enumerate(videos)}
+    # Submit downloads
+    futures = {
+        executor.submit(download_video, video, i, progress_dict): i
+        for i, video in enumerate(videos)
+    }
 
     try:
         while futures:
-            done, not_done = concurrent.futures.wait(
+            done, _not_done = concurrent.futures.wait(
                 futures,
                 timeout=0.5,
                 return_when=concurrent.futures.FIRST_COMPLETED
             )
+
+            # Update each bar
+            for i, bar in enumerate(progress_bars):
+                if i in progress_dict:
+                    data = progress_dict[i]
+                    # Progress = 0..100
+                    bar.n = data["progress"]
+                    # Show something like "3.12 MB / 15.00 MB @ 2.22 MB/s"
+                    postfix_str = f"{data['downloaded']} @ {data['speed']}"
+                    bar.set_postfix_str(postfix_str)
+                    bar.refresh()
+
             for fut in done:
                 overall_progress.update(1)
                 try:
@@ -221,14 +282,11 @@ def main():
                 overall_progress.write(str(result))
                 futures.pop(fut, None)
 
-            # If user pressed Ctrl+C or signaled shutdown
             if shutdown_flag:
                 overall_progress.write("Shutdown requested. Cancelling remaining tasks...")
                 for fut in futures:
                     fut.cancel()
-                # Cancel futures, do not wait
                 executor.shutdown(wait=False, cancel_futures=True)
-                # Attempt to forcibly kill child processes
                 if pool_processes:
                     for p in pool_processes.values():
                         if p.is_alive():
@@ -240,20 +298,19 @@ def main():
         for fut in futures:
             fut.cancel()
         executor.shutdown(wait=False, cancel_futures=True)
-        # Terminate child processes
         if pool_processes:
             for p in pool_processes.values():
                 if p.is_alive():
                     p.terminate()
 
     finally:
-        # If the loop ends normally, shut down the executor
-        # (If it hasn't been shut down yet)
         executor.shutdown(wait=False, cancel_futures=True)
-        # Force kill any leftover processes
         terminate_child_processes(executor)
         overall_progress.close()
+        for bar in progress_bars:
+            bar.close()
         print("Cleanup complete. Exiting...")
 
 if __name__ == "__main__":
     main()
+
