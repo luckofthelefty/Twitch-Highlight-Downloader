@@ -3,6 +3,7 @@ import sys
 import time
 import requests
 import yt_dlp
+import json
 import concurrent.futures
 import signal
 from tqdm import tqdm
@@ -10,12 +11,10 @@ from multiprocessing import Manager
 
 # Configuration (Replace with your own values or load from environment variables)
 TWITCH_CLIENT_ID = "YOUR_TWITCH_CLIENT_ID"
-TWITCH_ACCESS_TOKEN = "YOUR_TWITCH_ACCESS_TOKEN"
-TWITCH_REFRESH_TOKEN = "YOUR_TWITCH_REFRESH_TOKEN"  # If needed for token refresh
 USER_ID = "YOUR_TWITCH_USER_ID"
 SAVE_DIR = "YOUR_SAVE_DIRECTORY_PATH"  # Example: "/path/to/highlights"
 MAX_CONCURRENT_DOWNLOADS = 10
-
+CONFIG_FILE = "tokens.json"
 os.makedirs(SAVE_DIR, exist_ok=True)
 shutdown_flag = False
 
