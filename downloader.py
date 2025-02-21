@@ -1,30 +1,37 @@
 import os
 import sys
 import time
+import json
+import datetime
 import requests
 import yt_dlp
-import json
 import concurrent.futures
 import signal
 from tqdm import tqdm
 from multiprocessing import Manager
 
-# Configuration (Replace with your own values or load from environment variables)
-TWITCH_CLIENT_ID = "YOUR_TWITCH_CLIENT_ID"
-USER_ID = "YOUR_TWITCH_USER_ID"
-SAVE_DIR = "YOUR_SAVE_DIRECTORY_PATH"  # Example: "/path/to/highlights"
+# ---------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------
+TWITCH_CLIENT_ID = ""
+TWITCH_CLIENT_SECRET = ""
+USER_ID = ""
+SAVE_DIR = ""
 MAX_CONCURRENT_DOWNLOADS = 10
-CONFIG_FILE = "tokens.json"
+CONFIG_FILE = "tokens.json"  # File to store OAuth tokens
+
 os.makedirs(SAVE_DIR, exist_ok=True)
-shutdown_flag = False
+# Global termination event; will be initialized in main()
+termination_event = None
 
 # ---------------------------------------------------------------------
 # Signal Handling
 # ---------------------------------------------------------------------
 def signal_handler(sig, frame):
-    global shutdown_flag
+    global termination_event
     print("\nShutdown requested. Cleaning up...")
-    shutdown_flag = True
+    if termination_event is not None:
+        termination_event.set()
 
 signal.signal(signal.SIGINT, signal_handler)
 
@@ -117,7 +124,15 @@ def get_twitch_highlights(max_videos, downloaded_videos):
     downloaded_filenames = {file.lower() for file in downloaded_videos}
     remaining_videos = []
     for video in all_videos:
-        file_name = f"{sanitize_filename(video['title'])}.mp4"
+        # Use 'created_at' from the video data
+        date_field = video.get("created_at")
+        try:
+            video_date = datetime.datetime.strptime(date_field, "%Y-%m-%dT%H:%M:%SZ")
+        except Exception as e:
+            print(f"❌ Error parsing date for video '{video.get('title', 'Unknown')}': {e}")
+            continue
+        date_str = video_date.strftime("%Y%m%d")
+        file_name = f"{date_str}_{sanitize_filename(video['title'])}.mp4"
         if file_name not in downloaded_filenames:
             remaining_videos.append(video)
         if len(remaining_videos) >= max_videos:
@@ -131,18 +146,19 @@ class MyLogger:
     def error(self, msg): print(msg)
 
 # ---------------------------------------------------------------------
-# Progress Hook and Download Function (Working Version)
+# Progress Hook and Download Function
 # ---------------------------------------------------------------------
-def create_progress_hook(shared_dict, index):
+def create_progress_hook(shared_dict, index, termination_event):
     """
     Creates a progress hook that updates a shared dictionary with:
        - progress (0-100)
        - speed (e.g., "1.23 MB/s")
-    Falls back to using fragment_index if total_bytes is missing.
+    If termination_event is set, an exception is raised to abort the download.
     """
     def hook(status_dict):
-        if shutdown_flag:
-            return
+        if termination_event.is_set():
+            # Abort the download by raising an exception.
+            raise KeyboardInterrupt("Download cancelled by user")
         if status_dict["status"] == "downloading":
             total_bytes = status_dict.get("total_bytes")
             if total_bytes and total_bytes > 0:
@@ -166,12 +182,23 @@ def create_progress_hook(shared_dict, index):
             shared_dict[index] = {"progress": 100, "speed": "0.00 MB/s"}
     return hook
 
-def download_video(video, index, shared_dict):
+def download_video(video, index, shared_dict, termination_event):
     """
     Downloads a video using yt_dlp with a progress hook that updates shared_dict.
+    Aborts early if termination_event is set.
     """
+    if termination_event.is_set():
+        return f"Cancelled: {video['title']}"
+        
+    # Use the 'created_at' field to get the date
+    date_field = video.get("created_at")
+    try:
+        video_date = datetime.datetime.strptime(date_field, "%Y-%m-%dT%H:%M:%SZ")
+    except Exception as e:
+        return f"Failed to parse date for video {video['title']}: {e}"
+    date_str = video_date.strftime("%Y%m%d")
     video_title = sanitize_filename(video["title"])
-    save_path = os.path.join(SAVE_DIR, f"{video_title}.mp4")
+    save_path = os.path.join(SAVE_DIR, f"{date_str}_{video_title}.mp4")
     if os.path.exists(save_path):
         shared_dict[index] = {"progress": 100, "speed": "0.00 MB/s"}
         return f"Already downloaded: {save_path}"
@@ -181,7 +208,7 @@ def download_video(video, index, shared_dict):
         "logger": MyLogger(),
         "quiet": True,
         "no_warnings": True,
-        "progress_hooks": [create_progress_hook(shared_dict, index)]
+        "progress_hooks": [create_progress_hook(shared_dict, index, termination_event)]
     }
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -206,8 +233,10 @@ def terminate_child_processes(executor):
 # Main Routine
 # ---------------------------------------------------------------------
 def main():
+    global termination_event
     load_tokens()
     manager = Manager()
+    termination_event = manager.Event()
     progress_dict = manager.dict()
     downloaded_videos = set(os.listdir(SAVE_DIR))
     max_videos = int(sys.argv[1]) if len(sys.argv) > 1 else 2
@@ -224,30 +253,40 @@ def main():
         for i, vid in enumerate(videos)
     ]
 
-    with concurrent.futures.ProcessPoolExecutor(max_workers=MAX_CONCURRENT_DOWNLOADS) as executor:
-        futures = {executor.submit(download_video, video, i, progress_dict): i for i, video in enumerate(videos)}
-        completed = set()
-        while len(completed) < len(futures):
-            for i, bar in enumerate(progress_bars):
-                data = progress_dict.get(i, {"progress": 0, "speed": "N/A"})
-                bar.n = data["progress"]
-                bar.set_postfix_str(data["speed"])
-                bar.refresh()
-            for fut in list(futures):
-                if fut.done() and fut not in completed:
-                    overall_progress.update(1)
-                    try:
-                        result = fut.result()
-                    except Exception as exc:
-                        result = f"Download failed: {exc}"
-                    overall_progress.write(result)
-                    completed.add(fut)
-                    futures.pop(fut, None)
-            time.sleep(0.2)
-    overall_progress.close()
-    for bar in progress_bars:
-        bar.close()
-    print("Cleanup complete. Exiting...")
+    try:
+        with concurrent.futures.ProcessPoolExecutor(max_workers=MAX_CONCURRENT_DOWNLOADS) as executor:
+            futures = {
+                executor.submit(download_video, video, i, progress_dict, termination_event): i 
+                for i, video in enumerate(videos)
+            }
+            completed = set()
+            while len(completed) < len(futures):
+                for i, bar in enumerate(progress_bars):
+                    data = progress_dict.get(i, {"progress": 0, "speed": "N/A"})
+                    bar.n = data["progress"]
+                    bar.set_postfix_str(data["speed"])
+                    bar.refresh()
+                for fut in list(futures):
+                    if fut.done() and fut not in completed:
+                        overall_progress.update(1)
+                        try:
+                            result = fut.result()
+                        except Exception as exc:
+                            result = f"Download failed: {exc}"
+                        overall_progress.write(result)
+                        completed.add(fut)
+                        futures.pop(fut, None)
+                time.sleep(0.2)
+    except KeyboardInterrupt:
+        print("Shutdown requested. Terminating processes...")
+        termination_event.set()
+        executor.shutdown(wait=False)
+        terminate_child_processes(executor)
+    finally:
+        overall_progress.close()
+        for bar in progress_bars:
+            bar.close()
+        print("Cleanup complete. Exiting...")
 
 if __name__ == "__main__":
     main()
